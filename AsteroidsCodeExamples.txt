@@ -1,0 +1,730 @@
+        
+		///FROM Ship class
+		
+		/// <summary>
+        /// Called when ship is being updated, Ship property is never null when OnUpdate is called.
+        /// </summary>
+        public void OnUpdate()
+        {
+            BoundingBox targetSquare = new BoundingBox();
+            List<WorldObject> objWithinRange = new List<WorldObject>();
+            Asteroid target = null;
+
+            //we create a target square that will query objects within a X, Z square dictated by range
+            targetSquare.Min = new Vector3(Ship.Position.X - range, -1, Ship.Position.Z - range);
+            targetSquare.Max = new Vector3(Ship.Position.X + range, 1, Ship.Position.Z + range);
+
+            //get the asteroids in the current world within that box
+            Ship.World.Query(targetSquare, objWithinRange);
+
+            target = selectTarget(objWithinRange);
+
+            if (target != null)
+            {
+                //get positions and velocities of target and ship 
+                Vector3 targetPos = target.Position;
+                Vector3 shipPos = Ship.Position;
+                Vector3 shipVel = Ship.LinearVelocity;
+                Vector3 targetVel = target.LinearVelocity;
+                
+                //calculate the distance to the target from ships current position
+                Vector3 relativePos1 = targetPos - shipPos;
+                float targetDistance1 = (float)Math.Sqrt(relativePos1.LengthSquared());
+
+                //calculate the position the ship will be at when shot is fired
+                float loadingTime = (float)Ship.GunInfo.Interval.TotalSeconds;
+                Vector3 adjustedShipPos = new Vector3(shipPos.X + shipVel.X * loadingTime, 0, shipPos.Z + shipVel.Z * loadingTime);
+
+                //calculate the distance to target from ships predicted position when shot is fired. 
+                Vector3 relativePos2 = targetPos - adjustedShipPos;
+                float targetDistance2 = (float)Math.Sqrt(relativePos2.LengthSquared());
+
+                //calculate time it takes for shot to get from adjusted position to target position.
+                //not accurate, but allows us to calculate if target will move closer or farther. 
+                float timeToImpact = targetDistance2 / Ship.GunInfo.ProjectileSpeed;
+
+                //correct the time to impact calculation to factor in the error due to travel time of shot. 
+                //target is going to be closer to ship at firing time, tweak time to impact down 
+                if (targetDistance1 > targetDistance2) 
+                {
+                    timeToImpact = (float)(timeToImpact * 0.85);
+                } else if (targetDistance1 < targetDistance2) //target is farther from ship at firing time...tweak time to impact upwards
+                {
+                    timeToImpact = (float)(timeToImpact * 1.15);
+                }
+
+                //predict where target will be when adjusted time to impact is factored in 
+                Vector3 predictedPosAtImpact = new Vector3(relativePos2.X + targetVel.X * timeToImpact, 0, relativePos2.Z + targetVel.Z * timeToImpact);
+
+                //dont attempt to shoot an asteroid which will be farther away than we can reach in shots lifetime
+                if (timeToImpact < Ship.GunInfo.ProjectileLifetime.TotalSeconds)
+                {
+                    prevShotAts.Enqueue(target); //add to prev shots at so we dont waste a shot shooting an asteroid that is already destroyed
+                    Ship.Shoot(predictedPosAtImpact);
+                } 
+                
+            }
+        }
+		
+		        /// <summary>
+        /// A method for selecting a valid asteroid from a list of objects. 
+        /// </summary>
+        /// <param name="possibleTargets"></param>
+        /// <returns></returns>
+        public Asteroid selectTarget(List<WorldObject> possibleTargets)
+        {
+
+            Asteroid closestTarget = null;
+            float distance = float.PositiveInfinity; 
+
+            //loop through objects until we find an asteroid to use as a target
+            for (int i = 0; i < possibleTargets.Count(); i++)
+            {
+                if (possibleTargets[i].GetType().ToString().Contains("Asteroid")) //verify object is an asteroid
+                {
+                    //Get closest object that was not already shot at. 
+                    float newDistance = (Ship.Position - possibleTargets[i].Position).LengthSquared();
+                    if (distance > newDistance && !prevShotAts.Contains(possibleTargets[i]))
+                    {
+                        distance = newDistance;
+                        closestTarget = (Asteroid)possibleTargets[i];
+                    }
+                }
+            }
+
+            return closestTarget;
+        }
+		
+		
+		
+		        /// <summary>
+        /// Calculates precise collision of two moving objects.
+        /// Returns exact delta time of touch (e.g. 1 is one second in future from now).
+        /// When objects are already touching or overlapping, returns zero. When the objects won't ever touch, returns positive infinity.
+        /// </summary>
+        public float PreciseCollision(WorldObject a, WorldObject b)
+        {
+            #region Approach # 3 - Algebraic using pythagorean theorem and dot product, was able to get to almost 100% accuracy 
+            //First check if objects are already touching, if so, return 0
+            if (collision(a, b)) {
+                return 0;
+            }
+
+            //Get vectors describing the relative position and velocity of the two object system
+            Vector3 relativeDistance = a.Position - b.Position;
+            Vector3 relativeVelocity = a.LinearVelocity - b.LinearVelocity;
+
+
+            //Now check if dot product of relative distance and velocity of two objects is > or = to 0...this would indicate the objects are 
+            //already moving away from eachother so will never touch. https://www.youtube.com/watch?v=ocUMLijamY8 (I'm a little shaky on the underlying math here)  
+            float dotProduct = Vector3.Dot(relativeDistance, relativeVelocity);
+            if (dotProduct > 0)
+            {
+                return float.PositiveInfinity;
+            }
+
+            //if dot product < 0, we can conclude the objects are getting closer. 
+
+            //get a distance var representing how far apart the objects must be to touch 
+            double collideDistance = a.BoundingRadius + b.BoundingRadius;
+            
+            //derived a formula for minimizing the quadratic equation of the distance 2, according to formula for finding the vertex of a parabola
+            //(If we represent distance as a quadratic equation, the slope of distance represents the relative velocity. When relative velocity is 0, the objects are as close as they can be)
+            //ergo, if we find the time, T, it takes for the slope to be 0, we have found the time t of closest approach and can calculate the distance there.
+            //The formula -b / 2a can be used on a quadratic equation to find when it's close is 0 (IE, we are at the vertex of a parabola) 
+            //https://www.youtube.com/watch?v=aUqjpapdy8o
+            //https://www.wikihow.com/Find-the-Maximum-or-Minimum-Value-of-a-Quadratic-Function-Easily
+
+            double bTerm = 2 * (relativeDistance.X * relativeVelocity.X) + 2 * (relativeDistance.Z * relativeVelocity.Z); 
+            double aTerm = 2 * ((relativeVelocity.X * relativeVelocity.X) + (relativeVelocity.Z * relativeVelocity.Z));
+
+            double timeToClosestApproach = (double)(-1 * (bTerm / aTerm));
+
+            //get the closest possible distance along the relative path 
+
+            double closestApproachDistance = Math.Sqrt((relativeDistance + relativeVelocity * (float)timeToClosestApproach).LengthSquared());
+
+            //// skip if they never touch
+            if (closestApproachDistance > collideDistance)
+            {
+                return float.PositiveInfinity;
+            }
+
+            ////get a distance var representing how far apart they are NOW using pythagorean theorem 
+            double currentDistance = (double)Math.Sqrt(relativeDistance.LengthSquared());
+
+            ////get the net distance objects must travel with the relative velocity for current distance to shrink to collide distance 
+            double distanceToCollide = (double)(currentDistance - collideDistance);
+
+            ////derive a velocity number describing the net motion of the two object system along the hypotenuse of the relative velocity vector 
+            double velocityAlongHypotenuse = Math.Sqrt(relativeVelocity.LengthSquared());
+
+            ////time to collision is number of ticks needed for distance velocity to move distanceToCollide
+            float time = (float)(distanceToCollide / velocityAlongHypotenuse);
+
+            return (float)time; //There is a very small math error somewhere...not sure why. Hope 99.92% is okay :) 
+
+            #endregion
+
+            #region Approach # 2 - Algebraic solving of collision based on points where they intersect, based on using parametric formulas (does not capture radius) - 65% accurate but much faster! 
+
+            //First check if objects are already touching, if so, return 0
+            //if (collision(a, b))
+            //{
+            //    return 0;
+            //}
+
+            //Vector3 aVel = a.LinearVelocity;
+            //Vector3 bVel = b.LinearVelocity;
+            //Vector3 aPos = a.Position;
+            //Vector3 bPos = b.Position;
+
+            ////modifiy positions to account for radius
+
+            //float xDiff = aVel.X - bVel.X;
+            //float zDiff = aVel.Z - bVel.Z;
+
+            //Vector3 posDelta = aPos - bPos;
+
+            //float xTime = 0;
+            //float zTime = 0;
+
+            //if (xDiff != 0)
+            //{
+            //    xTime = posDelta.X / xDiff;
+            //}
+
+            //if (zDiff != 0)
+            //{
+            //    zTime = posDelta.Z / zDiff;
+            //}
+
+            ////substitute it into the z equation
+            //if (Math.Abs(xTime) > 0)
+            //{
+            //    float aZSub = aPos.Z + (aVel.Z * xTime);
+            //    float bZSub = bPos.Z + (bVel.Z * xTime);
+
+            //    if (aZSub == bZSub)
+            //    {
+            //        return xTime;
+            //    }
+            //}
+
+            ////substitute it into the X equation
+            //if (Math.Abs(zTime) > 0)
+            //{
+            //    float aXSub = aPos.X + (aVel.X * zTime);
+            //    float bXSub = bPos.X + (bVel.X * zTime);
+
+            //    if (aXSub == bXSub)
+            //    {
+            //        return xTime;
+            //    }
+            //}
+
+            //return float.PositiveInfinity;
+            #endregion
+
+            #region Approach # 1 - Iteratively calling the update method without any complicated algebra - 95% accurate but very slow!
+
+            //First check if objects are already touching, if so, return 0
+            //if (collision(a, b))
+            //{
+            //    return 0;
+            //}
+
+            ////iterate by 1 millisecond
+            //TimeSpan t = new TimeSpan(0, 0, 0, 0, 1);
+            //int ticks = 1;
+
+            ////get the current positions and the delta vector between the two. 
+            //Vector3 prevDelta = a.Position - b.Position;
+
+            //a.Update(t);
+            //b.Update(t);
+
+            //Vector3 currentDelta = a.Position - b.Position;
+
+            ////perfor
+
+            ////loop until positions intersect. If the delta between the two positions grows after one loop, that indicates that the objects are moving
+            ////away from eachother, so will never collide. Return positive infinity. 
+            //while ((Math.Abs(currentDelta.X) < Math.Abs(prevDelta.X)) || (Math.Abs(currentDelta.Z) < Math.Abs(prevDelta.Z)))
+            //{
+            //    ticks++; //add one millisecond to total
+
+            //    if (collision(a, b))
+            //    {
+            //        return ticks / 1000;
+            //    }
+
+            //    prevDelta = currentDelta;
+
+            //    a.Update(t);
+            //    b.Update(t);
+
+            //    currentDelta = a.Position - b.Position;
+
+            //}
+
+            //return float.PositiveInfinity;
+            #endregion
+        }
+    }
+	
+	
+	///WORLD class
+	 List<WorldObject> m_objects = new List<WorldObject>();
+
+        //added a variable for the ship so we can "see" where the camera is
+        public ShipBehavior ship;
+        Random numGenerator = new Random();
+
+        //range of radius for the asteroids
+        private int minRadius = 2;
+        private int maxRadius = 9;
+
+        //range of speeds for the asteroids
+        private int minSpeed = -25;
+        private int maxSpeed = 25;
+
+        //bounds on the X and Z axis for spawning/despawning asteroids. I tuned this via trial and error. 
+        private int xBound = 80;
+        private int zBound = 80;
+
+        //spawn side enumeration to help randomize what "side" of the screen our asteroids are going to spawn on
+        private enum SpawnSide
+        {
+            spawnLeft,
+            spawnRight,
+            spawnTop,
+            spawnBot
+        }
+
+        //array of the enum sides so we can randomly grab one
+        Array values = Enum.GetValues(typeof(SpawnSide));
+
+        /// <summary>
+        /// Time of the world, increased with each update.
+        /// </summary>
+        public TimeSpan Time { get; private set; }
+
+        /// <summary>
+        /// Adds new object into world.
+        /// World is responsible for calling OnAdded method on object when object is added.
+        /// </summary>
+        public void Add(WorldObject obj)
+        {
+            //I added this withinBounds check here to reduce the total # of asteroids to only those near the ship
+            //at the beginning. Throttling down the # of asteroids greatly reduces GC and processing time. 
+
+            //I just limited it to asteroids within bounds in the first second for initialization.
+            //after initial setup, the asteroid replace method will spawn asteroids close to ship, don't need to worry. 
+            if ((Time.TotalSeconds > 1) || (withinBounds(obj)))
+            {
+                obj.OnAdded(this);
+                m_objects.Add(obj);
+            } 
+
+        }
+
+        /// <summary>
+        /// Removes object from world.
+        /// World is responsible for calling OnRemoved method on object when object is removed.
+        /// </summary>
+        public void Remove(WorldObject obj)
+        {
+            m_objects.Remove(obj);
+            obj.OnRemoved();
+
+            double respawn = numGenerator.NextDouble();
+            if (respawn > 0.025) //there is a bug that if I always replace a removed asteroid, we will end up with 
+                                 //more and more asteroids on screen by end. Need to resolve why. 
+            {
+                replaceAsteroid();
+            }
+        }
+
+        /// <summary>
+        /// Replaces an asteroid that has been removed by spawning a new one on a random side of the screen. 
+        /// </summary>
+        public void replaceAsteroid()
+        {
+            //get location of the "player" ship
+            Vector3 shipPos = ship.Ship.BoundingBox.Center;
+
+            //cast to ints for simplicities sake
+            int xMin = (int)(shipPos.X - xBound);
+            int xMax = (int)(shipPos.X + xBound);
+            int zMax = (int)(shipPos.Z + zBound);
+            int zMin = (int)(shipPos.Z - zBound);
+
+            //randomly select a "spawn side" which will determine which edge of our bounds
+            //the asteroid spawns on
+            //Thanks to Darin at https://stackoverflow.com/questions/3132126/how-do-i-select-a-random-value-from-an-enumeration
+            SpawnSide currentSpawnSide = (SpawnSide)values.GetValue(numGenerator.Next(values.Length));
+
+            int zCoord = 0;
+            int xCoord = 0;
+
+            //Get random velocities on the X and Z axis for the asteroids
+            int xVel = 0;
+            int zVel = 0;
+            //create the proper coordinates to spawn on one side of our bounds
+            //and set velocity appropriately so they are moving towards the interior of screen or stationary
+            //otherwise they will immediatley despawn
+            switch (currentSpawnSide)
+            {
+                //random Z coord, -X bound
+                case SpawnSide.spawnLeft:
+                    zCoord = numGenerator.Next(zMin, zMax);
+                    xCoord = xMin;
+
+                    xVel = numGenerator.Next(5, maxSpeed);  
+                    zVel = numGenerator.Next(minSpeed, maxSpeed);  
+
+                    break;
+
+                //random Z coord, X bound
+                case SpawnSide.spawnRight:
+                    zCoord = numGenerator.Next(zMin, zMax);
+                    xCoord = xMax;
+
+                    xVel = numGenerator.Next(minSpeed, -5);
+                    zVel = numGenerator.Next(minSpeed, maxSpeed);
+
+                    break;
+                //random X coord, -Z bound
+                case SpawnSide.spawnBot:
+                    xCoord = numGenerator.Next(xMin, xMax);
+                    zCoord = zMin;
+
+                    xVel = numGenerator.Next(minSpeed, maxSpeed);
+                    zVel = numGenerator.Next(minSpeed, -5);
+
+                    break;
+                
+                //random X coord, Z bound
+                case SpawnSide.spawnTop:
+                    xCoord = numGenerator.Next(xMin, xMax);
+                    zCoord = zMax;
+
+                    xVel = numGenerator.Next(minSpeed, maxSpeed);
+                    zVel = numGenerator.Next(5, maxSpeed);
+                    break;
+
+                default:
+
+                    break;
+            }
+
+            //get a random radius for this asteroid
+            int radius = numGenerator.Next(minRadius, maxRadius);
+
+
+            //add the replacement asteroid to our world
+            Vector3 newPos = new Vector3(xCoord, 0, zCoord);
+            Vector3 newVel = new Vector3(xVel, 0, zVel);
+            Add(new Asteroid(newPos, newVel, radius));
+        }
+
+        /// <summary>
+        /// Called when object is moved in the world.
+        /// </summary>
+        public void OnObjectMoved(WorldObject obj, Vector3 displacement)
+        {
+        }
+
+        /// <summary>
+        /// Clears whole world and resets the time.
+        /// </summary>
+        public void Clear()
+        {
+            Time = TimeSpan.Zero;
+            m_objects.Clear();
+        }
+
+        /// <summary>
+        /// Queries the world for objects in a box. Matching objects are added into result list.
+        /// Query should return all overlapping objects.
+        /// </summary>
+        public void Query(BoundingBox box, List<WorldObject> resultList)
+        {
+            foreach(var obj in m_objects)
+            {
+                if (obj.BoundingBox.Contains(box) != ContainmentType.Disjoint)
+                {
+                    resultList.Add(obj);
+                   
+                } 
+            }
+        }
+
+        /// <summary>
+        /// Updates the world in following order:
+        /// 1. Increase time.
+        /// 2. Call Update on all objects with NeedsUpdate flag.
+        /// 3. Call PostUpdate on all objects with NeedsUpdate flag.
+        /// PostUpdate on first object must be called when all other objects are Updated.
+        /// </summary>
+        public void Update(TimeSpan deltaTime)
+        {
+            Time += deltaTime;
+
+            //Used lambdas to avoid the toArray()s for garbage collections sake. 
+            m_objects.ForEach(obj => { if (!withinBounds(obj)) Remove(obj); });
+            m_objects.ForEach(obj => { if (obj.NeedsUpdate) obj.Update(deltaTime); });
+            m_objects.ForEach(obj => { if (obj.NeedsUpdate) obj.PostUpdate(); });
+
+
+            //foreach (var obj in m_objects.ToArray())
+            //{
+            //    if (obj.NeedsUpdate)
+            //    {
+            //        obj.Update(deltaTime);
+            //    }
+
+            //}
+
+            //foreach (var obj in m_objects.ToArray())
+            //{
+            //    //if statement is redundant?
+            //    if (obj.NeedsUpdate)
+            //    {
+            //        obj.PostUpdate();
+            //    }
+            //}
+        }
+
+
+        /// <summary>
+        /// Custom method for detecting if an object is near the player
+        /// 1. Get the posiion of the object
+        /// 2. Check if it is within the defined X and Z bounds. 
+        /// </summary>
+        /// <param name="obj">The object to be checked. Typically, an asteroid.</param>
+        private bool withinBounds(WorldObject obj)
+        {
+            //get the center of the object we want to check
+            Vector3 objCenter = obj.BoundingBox.Center;
+            float xDelta = 0;
+            float zDelta = 0;
+
+            //if the ship has spawned into the world, use it's center as the cameras frame of reference
+            if (ship.Ship != null)
+            {
+                //calculate absolute values from the ship to the object on X and Z axis; if abs value exceeds bound, return false
+                zDelta = ship.Ship.BoundingBox.Center.Z - objCenter.Z;
+                xDelta = ship.Ship.BoundingBox.Center.X - objCenter.X;
+
+                if ((Math.Abs(zDelta) > zBound) || (Math.Abs(xDelta) > xBound))
+                {
+                    return false;
+                }
+                return true;
+            }
+            else //use the center of our coord system as the frame of reference. Need this at the beginning when asteroids are added before ship object. 
+            {
+                if ((objCenter.X < -xBound || objCenter.X > xBound ||
+                     objCenter.Z < -zBound || objCenter.Z > zBound))
+                {
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Added a modified collision check based on query method for calling in precise collision. 
+        /// </summary>
+        /// <param name="a"></param>
+        /// <param name="b"></param>
+        /// <returns></returns>
+        public bool collision(WorldObject a, WorldObject b)
+        {
+            if (a.BoundingBox.Contains(b.BoundingBox) != ContainmentType.Disjoint)
+            {
+                return true;
+            } else
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Calculates precise collision of two moving objects.
+        /// Returns exact delta time of touch (e.g. 1 is one second in future from now).
+        /// When objects are already touching or overlapping, returns zero. When the objects won't ever touch, returns positive infinity.
+        /// </summary>
+        public float PreciseCollision(WorldObject a, WorldObject b)
+        {
+            #region Approach # 3 - Algebraic using pythagorean theorem and dot product, was able to get to almost 100% accuracy 
+            //First check if objects are already touching, if so, return 0
+            if (collision(a, b)) {
+                return 0;
+            }
+
+            //Get vectors describing the relative position and velocity of the two object system
+            Vector3 relativeDistance = a.Position - b.Position;
+            Vector3 relativeVelocity = a.LinearVelocity - b.LinearVelocity;
+
+
+            //Now check if dot product of relative distance and velocity of two objects is > or = to 0...this would indicate the objects are 
+            //already moving away from eachother so will never touch. https://www.youtube.com/watch?v=ocUMLijamY8 (I'm a little shaky on the underlying math here)  
+            float dotProduct = Vector3.Dot(relativeDistance, relativeVelocity);
+            if (dotProduct > 0)
+            {
+                return float.PositiveInfinity;
+            }
+
+            //if dot product < 0, we can conclude the objects are getting closer. 
+
+            //get a distance var representing how far apart the objects must be to touch 
+            double collideDistance = a.BoundingRadius + b.BoundingRadius;
+            
+            //derived a formula for minimizing the quadratic equation of the distance 2, according to formula for finding the vertex of a parabola
+            //(If we represent distance as a quadratic equation, the slope of distance represents the relative velocity. When relative velocity is 0, the objects are as close as they can be)
+            //ergo, if we find the time, T, it takes for the slope to be 0, we have found the time t of closest approach and can calculate the distance there.
+            //The formula -b / 2a can be used on a quadratic equation to find when it's close is 0 (IE, we are at the vertex of a parabola) 
+            //https://www.youtube.com/watch?v=aUqjpapdy8o
+            //https://www.wikihow.com/Find-the-Maximum-or-Minimum-Value-of-a-Quadratic-Function-Easily
+
+            double bTerm = 2 * (relativeDistance.X * relativeVelocity.X) + 2 * (relativeDistance.Z * relativeVelocity.Z); 
+            double aTerm = 2 * ((relativeVelocity.X * relativeVelocity.X) + (relativeVelocity.Z * relativeVelocity.Z));
+
+            double timeToClosestApproach = (double)(-1 * (bTerm / aTerm));
+
+            //get the closest possible distance along the relative path 
+
+            double closestApproachDistance = Math.Sqrt((relativeDistance + relativeVelocity * (float)timeToClosestApproach).LengthSquared());
+
+            //// skip if they never touch
+            if (closestApproachDistance > collideDistance)
+            {
+                return float.PositiveInfinity;
+            }
+
+            ////get a distance var representing how far apart they are NOW using pythagorean theorem 
+            double currentDistance = (double)Math.Sqrt(relativeDistance.LengthSquared());
+
+            ////get the net distance objects must travel with the relative velocity for current distance to shrink to collide distance 
+            double distanceToCollide = (double)(currentDistance - collideDistance);
+
+            ////derive a velocity number describing the net motion of the two object system along the hypotenuse of the relative velocity vector 
+            double velocityAlongHypotenuse = Math.Sqrt(relativeVelocity.LengthSquared());
+
+            ////time to collision is number of ticks needed for distance velocity to move distanceToCollide
+            float time = (float)(distanceToCollide / velocityAlongHypotenuse);
+
+            return (float)time; //There is a very small math error somewhere...not sure why. Hope 99.92% is okay :) 
+
+            #endregion
+
+            #region Approach # 2 - Algebraic solving of collision based on points where they intersect, based on using parametric formulas (does not capture radius) - 65% accurate but much faster! 
+
+            //First check if objects are already touching, if so, return 0
+            //if (collision(a, b))
+            //{
+            //    return 0;
+            //}
+
+            //Vector3 aVel = a.LinearVelocity;
+            //Vector3 bVel = b.LinearVelocity;
+            //Vector3 aPos = a.Position;
+            //Vector3 bPos = b.Position;
+
+            ////modifiy positions to account for radius
+
+            //float xDiff = aVel.X - bVel.X;
+            //float zDiff = aVel.Z - bVel.Z;
+
+            //Vector3 posDelta = aPos - bPos;
+
+            //float xTime = 0;
+            //float zTime = 0;
+
+            //if (xDiff != 0)
+            //{
+            //    xTime = posDelta.X / xDiff;
+            //}
+
+            //if (zDiff != 0)
+            //{
+            //    zTime = posDelta.Z / zDiff;
+            //}
+
+            ////substitute it into the z equation
+            //if (Math.Abs(xTime) > 0)
+            //{
+            //    float aZSub = aPos.Z + (aVel.Z * xTime);
+            //    float bZSub = bPos.Z + (bVel.Z * xTime);
+
+            //    if (aZSub == bZSub)
+            //    {
+            //        return xTime;
+            //    }
+            //}
+
+            ////substitute it into the X equation
+            //if (Math.Abs(zTime) > 0)
+            //{
+            //    float aXSub = aPos.X + (aVel.X * zTime);
+            //    float bXSub = bPos.X + (bVel.X * zTime);
+
+            //    if (aXSub == bXSub)
+            //    {
+            //        return xTime;
+            //    }
+            //}
+
+            //return float.PositiveInfinity;
+            #endregion
+
+            #region Approach # 1 - Iteratively calling the update method without any complicated algebra - 95% accurate but very slow!
+
+            //First check if objects are already touching, if so, return 0
+            //if (collision(a, b))
+            //{
+            //    return 0;
+            //}
+
+            ////iterate by 1 millisecond
+            //TimeSpan t = new TimeSpan(0, 0, 0, 0, 1);
+            //int ticks = 1;
+
+            ////get the current positions and the delta vector between the two. 
+            //Vector3 prevDelta = a.Position - b.Position;
+
+            //a.Update(t);
+            //b.Update(t);
+
+            //Vector3 currentDelta = a.Position - b.Position;
+
+            ////perfor
+
+            ////loop until positions intersect. If the delta between the two positions grows after one loop, that indicates that the objects are moving
+            ////away from eachother, so will never collide. Return positive infinity. 
+            //while ((Math.Abs(currentDelta.X) < Math.Abs(prevDelta.X)) || (Math.Abs(currentDelta.Z) < Math.Abs(prevDelta.Z)))
+            //{
+            //    ticks++; //add one millisecond to total
+
+            //    if (collision(a, b))
+            //    {
+            //        return ticks / 1000;
+            //    }
+
+            //    prevDelta = currentDelta;
+
+            //    a.Update(t);
+            //    b.Update(t);
+
+            //    currentDelta = a.Position - b.Position;
+
+            //}
+
+            //return float.PositiveInfinity;
+            #endregion
+        }
+    }
